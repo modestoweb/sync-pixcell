@@ -12,6 +12,7 @@
   "type": "commonjs",
   "dependencies": {
     "@woocommerce/woocommerce-rest-api": "^1.0.2",
+    "axios": "^1.19.0",
     "dotenv": "^17.4.2",
     "mysql2": "^3.23.3"
   }
