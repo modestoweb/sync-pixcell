@@ -19,12 +19,6 @@ const WooCommerce = new WooCommerceRestApi({
   version: 'wc/v3',
 });
 
-// ---- DIAGNÓSTICO TEMPORÁRIO (remover depois de resolver o problema) ----
-console.log('🔍 Diagnóstico das variáveis:');
-console.log(`   WC_URL definida: ${!!process.env.WC_URL} (${process.env.WC_URL ? process.env.WC_URL.length : 0} caracteres)`);
-console.log(`   WC_CONSUMER_KEY definida: ${!!process.env.WC_CONSUMER_KEY} (${process.env.WC_CONSUMER_KEY ? process.env.WC_CONSUMER_KEY.length : 0} caracteres, começa com "${process.env.WC_CONSUMER_KEY ? process.env.WC_CONSUMER_KEY.substring(0, 4) : ''}")`);
-console.log(`   WC_CONSUMER_SECRET definida: ${!!process.env.WC_CONSUMER_SECRET} (${process.env.WC_CONSUMER_SECRET ? process.env.WC_CONSUMER_SECRET.length : 0} caracteres, começa com "${process.env.WC_CONSUMER_SECRET ? process.env.WC_CONSUMER_SECRET.substring(0, 4) : ''}")`);
-// ---- FIM DIAGNÓSTICO ----
 
 const GRUPOS_EXCLUIDOS = ['1.01.10', '1.01.11'];
 const MODO_TESTE = true;
