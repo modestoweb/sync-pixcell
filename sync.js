@@ -21,8 +21,8 @@ const WooCommerce = new WooCommerceRestApi({
 
 
 const GRUPOS_EXCLUIDOS = ['1.01.10', '1.01.11'];
-const MODO_TESTE = true;
-const LIMITE_TESTE = 30;
+const MODO_TESTE = false;
+// LIMITE_TESTE removido - roda com a base completa de produtos
 
 const cacheCategoriasWoo = new Map();
 
@@ -221,8 +221,7 @@ async function sincronizar() {
     console.log(`🗂️  ${mapaGrupos.size} grupos/categorias carregados do banco`);
 
     let produtos = await buscarProdutosPixcell(connection);
-    produtos = produtos.slice(0, LIMITE_TESTE);
-    console.log(`📦 ${produtos.length} produtos encontrados no banco Pixcell (testando com ${LIMITE_TESTE})`);
+    console.log(`📦 ${produtos.length} produtos encontrados no banco Pixcell`);
 
     let criados = 0;
     let atualizados = 0;
