@@ -105,38 +105,70 @@ function obterCategorias(produto, mapaGrupos) {
   return { nomeMae, nomeFilha };
 }
 
+// Guarda promises em andamento por chave de categoria, para que chamadas
+// paralelas pedindo a MESMA categoria aguardem a primeira terminar, em vez
+// de disparar duas criações simultâneas (o que causa erro 400 term_exists).
+const promisesEmAndamento = new Map();
+
 async function obterOuCriarCategoriaWoo(nome, paiId = null) {
   if (!nome) return null;
 
   const chaveCache = `${nome}::${paiId || 'root'}`;
+
   if (cacheCategoriasWoo.has(chaveCache)) {
     return cacheCategoriasWoo.get(chaveCache);
   }
 
-  const busca = await WooCommerce.get('products/categories', { search: nome, per_page: 100 });
-  let categoria = busca.data.find(
-    (c) => c.name.toLowerCase() === nome.toLowerCase() && (paiId ? c.parent === paiId : true)
-  );
-
-  if (!categoria) {
-    try {
-      const payload = { name: nome };
-      if (paiId) payload.parent = paiId;
-      const resposta = await WooCommerce.post('products/categories', payload);
-      categoria = resposta.data;
-      console.log(`📂 Categoria criada: ${nome}${paiId ? ' (subcategoria)' : ''}`);
-    } catch (erro) {
-      const idExistente = erro.response?.data?.resource_id;
-      if (idExistente) {
-        cacheCategoriasWoo.set(chaveCache, idExistente);
-        return idExistente;
-      }
-      throw erro;
-    }
+  // Se já existe uma chamada em andamento para essa mesma categoria,
+  // aguarda o resultado dela em vez de iniciar outra
+  if (promisesEmAndamento.has(chaveCache)) {
+    return promisesEmAndamento.get(chaveCache);
   }
 
-  cacheCategoriasWoo.set(chaveCache, categoria.id);
-  return categoria.id;
+  const promise = (async () => {
+    const busca = await WooCommerce.get('products/categories', { search: nome, per_page: 100 });
+    let categoria = busca.data.find(
+      (c) => c.name.toLowerCase() === nome.toLowerCase() && (paiId ? c.parent === paiId : true)
+    );
+
+    if (!categoria) {
+      try {
+        const payload = { name: nome };
+        if (paiId) payload.parent = paiId;
+        const resposta = await WooCommerce.post('products/categories', payload);
+        categoria = resposta.data;
+        console.log(`📂 Categoria criada: ${nome}${paiId ? ' (subcategoria)' : ''}`);
+      } catch (erro) {
+        const idExistente = erro.response?.data?.resource_id;
+        if (idExistente) {
+          cacheCategoriasWoo.set(chaveCache, idExistente);
+          return idExistente;
+        }
+        // Como último recurso: se a criação falhou por já existir (corrida
+        // entre chamadas paralelas), tenta buscar de novo antes de desistir
+        const buscaNovamente = await WooCommerce.get('products/categories', { search: nome, per_page: 100 });
+        const encontrada = buscaNovamente.data.find(
+          (c) => c.name.toLowerCase() === nome.toLowerCase() && (paiId ? c.parent === paiId : true)
+        );
+        if (encontrada) {
+          cacheCategoriasWoo.set(chaveCache, encontrada.id);
+          return encontrada.id;
+        }
+        throw erro;
+      }
+    }
+
+    cacheCategoriasWoo.set(chaveCache, categoria.id);
+    return categoria.id;
+  })();
+
+  promisesEmAndamento.set(chaveCache, promise);
+
+  try {
+    return await promise;
+  } finally {
+    promisesEmAndamento.delete(chaveCache);
+  }
 }
 
 // Pré-carrega/cria TODAS as categorias necessárias de uma vez, em paralelo
@@ -303,7 +335,11 @@ async function sincronizar() {
     }
 
     console.log(`⚙️  Preparando categorias em paralelo...`);
-    await prepararCategoriasEmParalelo(paraProcessar, mapaGrupos);
+    try {
+      await prepararCategoriasEmParalelo(paraProcessar, mapaGrupos);
+    } catch (erroCategoria) {
+      console.log(`⚠️  Erro ao preparar categorias em paralelo (algumas podem ficar sem categoria nesta rodada): ${erroCategoria.message}`);
+    }
 
     console.log(`⚙️  ${paraProcessar.length} produtos a processar em lotes de ${TAMANHO_LOTE}...`);
 
