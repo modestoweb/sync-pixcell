@@ -10,6 +10,7 @@ const dbConfig = {
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
+  connectTimeout: 20000, // 20s para tentar conectar antes de desistir dessa tentativa
 };
 
 const WooCommerce = new WooCommerceRestApi({
@@ -22,10 +23,12 @@ const WooCommerce = new WooCommerceRestApi({
 const GRUPOS_EXCLUIDOS = ['1.01.10', '1.01.11'];
 const MODO_TESTE = false;
 const TAMANHO_LOTE = 100; // máximo aceito pelo endpoint products/batch do WooCommerce
+const TENTATIVAS_CONEXAO = 3;
+const ESPERA_ENTRE_TENTATIVAS_MS = 5000;
 
 const cacheCategoriasWoo = new Map();
 
-// ---- Funções auxiliares (iguais à versão anterior) ----
+// ---- Funções auxiliares ----
 
 function grupoExcluido(classif) {
   return GRUPOS_EXCLUIDOS.some((codigo) => classif && classif.startsWith(codigo));
@@ -54,6 +57,34 @@ function codigoCategoriaMae(classifNormalizado) {
   const partes = classifNormalizado.split('.');
   if (partes.length < 3) return null;
   return partes.slice(0, 3).join('.');
+}
+
+function aguardar(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Tenta conectar no banco várias vezes antes de desistir - absorve falhas
+// momentâneas de rede (ex: ETIMEDOUT) sem derrubar a sincronização inteira.
+async function conectarComRetry() {
+  let ultimoErro;
+
+  for (let tentativa = 1; tentativa <= TENTATIVAS_CONEXAO; tentativa++) {
+    try {
+      const connection = await mysql.createConnection(dbConfig);
+      if (tentativa > 1) {
+        console.log(`✅ Conectado ao banco na tentativa ${tentativa}`);
+      }
+      return connection;
+    } catch (erro) {
+      ultimoErro = erro;
+      console.log(`⚠️  Tentativa ${tentativa}/${TENTATIVAS_CONEXAO} de conexão falhou: ${erro.message}`);
+      if (tentativa < TENTATIVAS_CONEXAO) {
+        await aguardar(ESPERA_ENTRE_TENTATIVAS_MS);
+      }
+    }
+  }
+
+  throw ultimoErro;
 }
 
 async function carregarMapaGrupos(connection) {
@@ -108,45 +139,31 @@ async function obterOuCriarCategoriaWoo(nome, paiId = null) {
   return categoria.id;
 }
 
-async function resolverCategoriaIds(produto, mapaGrupos) {
-  const { nomeMae, nomeFilha } = obterCategorias(produto, mapaGrupos);
-  if (!nomeMae && !nomeFilha) return [];
+// Pré-carrega/cria TODAS as categorias necessárias de uma vez, em paralelo
+// (em pequenos grupos de 10), antes de montar os payloads dos produtos.
+async function prepararCategoriasEmParalelo(produtos, mapaGrupos) {
+  const combinacoesUnicas = new Map();
 
-  const idMae = nomeMae ? await obterOuCriarCategoriaWoo(nomeMae) : null;
-
-  if (nomeFilha && nomeFilha !== nomeMae) {
-    const idFilha = await obterOuCriarCategoriaWoo(nomeFilha, idMae);
-    return idFilha ? [{ id: idFilha }] : idMae ? [{ id: idMae }] : [];
-  }
-
-  return idMae ? [{ id: idMae }] : [];
-}
-
-async function buscarImagemPorSku(sku) {
-  try {
-    const wpUrl = `${process.env.WC_URL}/wp-json/wp/v2/media`;
-    const auth = Buffer.from(`${process.env.WC_CONSUMER_KEY}:${process.env.WC_CONSUMER_SECRET}`).toString('base64');
-
-    const resposta = await require('axios').get(wpUrl, {
-      params: { search: sku, per_page: 5 },
-      headers: { Authorization: `Basic ${auth}` },
-    });
-
-    if (resposta.data && resposta.data.length > 0) {
-      const match = resposta.data.find((midia) => {
-        const nomeArquivo = midia.slug || '';
-        return nomeArquivo.toLowerCase() === sku.toLowerCase();
-      });
-      return match ? match.source_url : null;
+  for (const { produto } of produtos) {
+    const { nomeMae, nomeFilha } = obterCategorias(produto, mapaGrupos);
+    if (!nomeMae && !nomeFilha) continue;
+    const chave = `${nomeMae || ''}::${nomeFilha || ''}`;
+    if (!combinacoesUnicas.has(chave)) {
+      combinacoesUnicas.set(chave, { nomeMae, nomeFilha });
     }
-    return null;
-  } catch (erro) {
-    return null;
   }
-}
 
-function produtoTemImagem(produtoWoo) {
-  return produtoWoo && produtoWoo.images && produtoWoo.images.length > 0;
+  const tarefas = Array.from(combinacoesUnicas.values()).map(({ nomeMae, nomeFilha }) => async () => {
+    const idMae = nomeMae ? await obterOuCriarCategoriaWoo(nomeMae) : null;
+    if (nomeFilha && nomeFilha !== nomeMae) {
+      await obterOuCriarCategoriaWoo(nomeFilha, idMae);
+    }
+  });
+
+  const TAMANHO_PARALELO = 10;
+  for (let i = 0; i < tarefas.length; i += TAMANHO_PARALELO) {
+    await Promise.all(tarefas.slice(i, i + TAMANHO_PARALELO).map((fn) => fn()));
+  }
 }
 
 async function buscarProdutosPixcell(connection) {
@@ -155,7 +172,6 @@ async function buscarProdutosPixcell(connection) {
 }
 
 // Busca TODOS os produtos do WooCommerce de uma vez, paginando, e monta um mapa SKU -> produto.
-// Isso evita fazer uma chamada de API por produto só para "ver se já existe".
 async function carregarMapaProdutosWoo() {
   const mapa = new Map();
   let pagina = 1;
@@ -181,12 +197,22 @@ function dividirEmLotes(array, tamanho) {
   return lotes;
 }
 
-// Monta o payload de criação de um produto (mesma lógica de antes)
-async function montarPayloadCriacao(produto, sku, mapaGrupos) {
-  const categorias = await resolverCategoriaIds(produto, mapaGrupos);
-  const imagemUrl = await buscarImagemPorSku(sku);
+// Monta o payload de criação de um produto. NÃO busca imagem - isso agora é
+// responsabilidade do plugin do WordPress (associa no momento do upload).
+function montarPayloadCriacao(produto, sku, mapaGrupos) {
+  const { nomeMae, nomeFilha } = obterCategorias(produto, mapaGrupos);
+  const categorias = [];
 
-  const payload = {
+  const idMae = nomeMae ? cacheCategoriasWoo.get(`${nomeMae}::root`) : null;
+  if (nomeFilha && nomeFilha !== nomeMae) {
+    const idFilha = cacheCategoriasWoo.get(`${nomeFilha}::${idMae || 'root'}`);
+    if (idFilha) categorias.push({ id: idFilha });
+    else if (idMae) categorias.push({ id: idMae });
+  } else if (idMae) {
+    categorias.push({ id: idMae });
+  }
+
+  return {
     sku: sku,
     name: produto.descricao,
     regular_price: String(produto.preco_a),
@@ -197,36 +223,37 @@ async function montarPayloadCriacao(produto, sku, mapaGrupos) {
     status: MODO_TESTE ? 'draft' : 'publish',
     categories: categorias,
   };
-
-  if (imagemUrl) {
-    payload.images = [{ src: imagemUrl }];
-  }
-
-  return payload;
 }
 
-// Monta o payload de atualização de um produto existente
-async function montarPayloadAtualizacao(produto, sku, produtoWoo) {
-  const payload = {
+// Compara preço e estoque do banco Pixcell com o que já está no WooCommerce.
+// Preço é comparado como número (não como texto), pois o WooCommerce pode
+// devolver formatos como "150.00" enquanto o banco manda "150" - mesmo valor,
+// texto diferente. Usa uma pequena tolerância para evitar diferença de
+// arredondamento (ex: 150 vs 150.0001) disparar atualização à toa.
+function produtoMudou(produto, produtoWoo) {
+  const precoNovo = Number(produto.preco_a) || 0;
+  const precoAtual = Number(produtoWoo.regular_price) || 0;
+  const estoqueNovo = Number(produto.dep01) || 0;
+  const estoqueAtual = Number(produtoWoo.stock_quantity) || 0;
+
+  const precoMudou = Math.abs(precoNovo - precoAtual) > 0.005; // tolerância de meio centavo
+  const estoqueMudou = estoqueNovo !== estoqueAtual;
+
+  return precoMudou || estoqueMudou;
+}
+
+// Monta o payload de atualização de um produto existente (sem busca de imagem)
+function montarPayloadAtualizacao(produto, produtoWoo) {
+  return {
     id: produtoWoo.id,
     regular_price: String(produto.preco_a),
     stock_quantity: produto.dep01,
     manage_stock: true,
     stock_status: produto.dep01 > 0 ? 'instock' : 'outofstock',
   };
-
-  if (!produtoTemImagem(produtoWoo)) {
-    const imagemUrl = await buscarImagemPorSku(sku);
-    if (imagemUrl) {
-      payload.images = [{ src: imagemUrl }];
-    }
-  }
-
-  return payload;
 }
 
 // Envia um lote (até 100 produtos) para o endpoint batch do WooCommerce.
-// A API processa cada item de forma independente - um erro num item não afeta os outros.
 async function enviarLote(payloadCriar, payloadAtualizar) {
   const corpo = {};
   if (payloadCriar.length > 0) corpo.create = payloadCriar;
@@ -245,7 +272,7 @@ async function enviarLote(payloadCriar, payloadAtualizar) {
 async function sincronizar() {
   console.log(`\n--- Iniciando sincronização: ${new Date().toLocaleString('pt-BR')} ---`);
 
-  const connection = await mysql.createConnection(dbConfig);
+  const connection = await conectarComRetry();
 
   try {
     const mapaGrupos = await carregarMapaGrupos(connection);
@@ -258,7 +285,6 @@ async function sincronizar() {
     const produtos = await buscarProdutosPixcell(connection);
     console.log(`📦 ${produtos.length} produtos encontrados no banco Pixcell`);
 
-    // Separa os produtos a processar dos ignorados/pulados, sem bater na API ainda
     const paraProcessar = [];
     let ignorados = 0;
     let semIdentificador = 0;
@@ -276,9 +302,13 @@ async function sincronizar() {
       paraProcessar.push({ produto, sku });
     }
 
+    console.log(`⚙️  Preparando categorias em paralelo...`);
+    await prepararCategoriasEmParalelo(paraProcessar, mapaGrupos);
+
     console.log(`⚙️  ${paraProcessar.length} produtos a processar em lotes de ${TAMANHO_LOTE}...`);
 
     let criados = 0;
+    let semMudanca = 0;
     let atualizados = 0;
     let comErro = 0;
     const erros = [];
@@ -290,14 +320,16 @@ async function sincronizar() {
       const payloadCriar = [];
       const payloadAtualizar = [];
 
-      // Monta os payloads do lote (aqui ainda busca categoria/imagem individualmente,
-      // mas o ENVIO final é em lote - a parte lenta de rede é o que reduz)
       for (const { produto, sku } of lote) {
         const produtoWoo = mapaProdutosWoo.get(sku.toLowerCase());
         if (produtoWoo) {
-          payloadAtualizar.push(await montarPayloadAtualizacao(produto, sku, produtoWoo));
+          if (produtoMudou(produto, produtoWoo)) {
+            payloadAtualizar.push(montarPayloadAtualizacao(produto, produtoWoo));
+          } else {
+            semMudanca++;
+          }
         } else {
-          payloadCriar.push(await montarPayloadCriacao(produto, sku, mapaGrupos));
+          payloadCriar.push(montarPayloadCriacao(produto, sku, mapaGrupos));
         }
       }
 
@@ -330,7 +362,7 @@ async function sincronizar() {
     }
 
     console.log(`\n--- Sincronização concluída ---`);
-    console.log(`Criados: ${criados} | Atualizados: ${atualizados} | Ignorados (grupo excluído): ${ignorados} | Pulados (sem identificador): ${semIdentificador} | Com erro: ${comErro}`);
+    console.log(`Criados: ${criados} | Atualizados: ${atualizados} | Sem mudança (pulados): ${semMudanca} | Ignorados (grupo excluído): ${ignorados} | Pulados (sem identificador): ${semIdentificador} | Com erro: ${comErro}`);
 
     if (erros.length > 0) {
       console.log(`\nDetalhes dos erros:`);
