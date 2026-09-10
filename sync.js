@@ -34,12 +34,23 @@ function grupoExcluido(classif) {
   return GRUPOS_EXCLUIDOS.some((codigo) => classif && classif.startsWith(codigo));
 }
 
+// SKU definitivo do produto: SEMPRE baseado no campo "digito", nunca na
+// "referencia" (mesmo quando ela existe). Padrão combinado com o cliente
+// para manter os produtos organizados de forma consistente.
 function obterSku(produto) {
-  if (produto.referencia && produto.referencia.trim() !== '') {
-    return String(produto.referencia).trim();
-  }
   if (produto.digito !== null && produto.digito !== undefined && String(produto.digito).trim() !== '') {
     return `DIG-${produto.digito}`;
+  }
+  return null;
+}
+
+// SKU "antigo" que esse produto poderia ter recebido antes desta mudança de
+// regra (quando a referencia, se existisse, era usada como SKU). Usado só
+// para LOCALIZAR produtos já criados com o padrão antigo, e migrar o SKU
+// deles para o padrão novo (digito) sem duplicar o produto.
+function obterSkuAntigo(produto) {
+  if (produto.referencia && produto.referencia.trim() !== '') {
+    return String(produto.referencia).trim();
   }
   return null;
 }
@@ -63,8 +74,6 @@ function aguardar(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Tenta conectar no banco várias vezes antes de desistir - absorve falhas
-// momentâneas de rede (ex: ETIMEDOUT) sem derrubar a sincronização inteira.
 async function conectarComRetry() {
   let ultimoErro;
 
@@ -105,9 +114,6 @@ function obterCategorias(produto, mapaGrupos) {
   return { nomeMae, nomeFilha };
 }
 
-// Guarda promises em andamento por chave de categoria, para que chamadas
-// paralelas pedindo a MESMA categoria aguardem a primeira terminar, em vez
-// de disparar duas criações simultâneas (o que causa erro 400 term_exists).
 const promisesEmAndamento = new Map();
 
 async function obterOuCriarCategoriaWoo(nome, paiId = null) {
@@ -119,8 +125,6 @@ async function obterOuCriarCategoriaWoo(nome, paiId = null) {
     return cacheCategoriasWoo.get(chaveCache);
   }
 
-  // Se já existe uma chamada em andamento para essa mesma categoria,
-  // aguarda o resultado dela em vez de iniciar outra
   if (promisesEmAndamento.has(chaveCache)) {
     return promisesEmAndamento.get(chaveCache);
   }
@@ -144,8 +148,6 @@ async function obterOuCriarCategoriaWoo(nome, paiId = null) {
           cacheCategoriasWoo.set(chaveCache, idExistente);
           return idExistente;
         }
-        // Como último recurso: se a criação falhou por já existir (corrida
-        // entre chamadas paralelas), tenta buscar de novo antes de desistir
         const buscaNovamente = await WooCommerce.get('products/categories', { search: nome, per_page: 100 });
         const encontrada = buscaNovamente.data.find(
           (c) => c.name.toLowerCase() === nome.toLowerCase() && (paiId ? c.parent === paiId : true)
@@ -171,8 +173,6 @@ async function obterOuCriarCategoriaWoo(nome, paiId = null) {
   }
 }
 
-// Pré-carrega/cria TODAS as categorias necessárias de uma vez, em paralelo
-// (em pequenos grupos de 10), antes de montar os payloads dos produtos.
 async function prepararCategoriasEmParalelo(produtos, mapaGrupos) {
   const combinacoesUnicas = new Map();
 
@@ -203,7 +203,6 @@ async function buscarProdutosPixcell(connection) {
   return rows;
 }
 
-// Busca TODOS os produtos do WooCommerce de uma vez, paginando, e monta um mapa SKU -> produto.
 async function carregarMapaProdutosWoo() {
   const mapa = new Map();
   let pagina = 1;
@@ -229,8 +228,6 @@ function dividirEmLotes(array, tamanho) {
   return lotes;
 }
 
-// Monta o payload de criação de um produto. NÃO busca imagem - isso agora é
-// responsabilidade do plugin do WordPress (associa no momento do upload).
 function montarPayloadCriacao(produto, sku, mapaGrupos) {
   const { nomeMae, nomeFilha } = obterCategorias(produto, mapaGrupos);
   const categorias = [];
@@ -257,35 +254,37 @@ function montarPayloadCriacao(produto, sku, mapaGrupos) {
   };
 }
 
-// Compara preço e estoque do banco Pixcell com o que já está no WooCommerce.
-// Preço é comparado como número (não como texto), pois o WooCommerce pode
-// devolver formatos como "150.00" enquanto o banco manda "150" - mesmo valor,
-// texto diferente. Usa uma pequena tolerância para evitar diferença de
-// arredondamento (ex: 150 vs 150.0001) disparar atualização à toa.
 function produtoMudou(produto, produtoWoo) {
   const precoNovo = Number(produto.preco_a) || 0;
   const precoAtual = Number(produtoWoo.regular_price) || 0;
   const estoqueNovo = Number(produto.dep01) || 0;
   const estoqueAtual = Number(produtoWoo.stock_quantity) || 0;
 
-  const precoMudou = Math.abs(precoNovo - precoAtual) > 0.005; // tolerância de meio centavo
+  const precoMudou = Math.abs(precoNovo - precoAtual) > 0.005;
   const estoqueMudou = estoqueNovo !== estoqueAtual;
 
   return precoMudou || estoqueMudou;
 }
 
-// Monta o payload de atualização de um produto existente (sem busca de imagem)
-function montarPayloadAtualizacao(produto, produtoWoo) {
-  return {
+// Monta o payload de atualização. Quando o produto foi localizado pelo SKU
+// ANTIGO (referencia), o payload também inclui o novo SKU (digito) - migra
+// a identificação sem duplicar o produto.
+function montarPayloadAtualizacao(produto, produtoWoo, novoSku, precisaMigrarSku) {
+  const payload = {
     id: produtoWoo.id,
     regular_price: String(produto.preco_a),
     stock_quantity: produto.dep01,
     manage_stock: true,
     stock_status: produto.dep01 > 0 ? 'instock' : 'outofstock',
   };
+
+  if (precisaMigrarSku) {
+    payload.sku = novoSku;
+  }
+
+  return payload;
 }
 
-// Envia um lote (até 100 produtos) para o endpoint batch do WooCommerce.
 async function enviarLote(payloadCriar, payloadAtualizar) {
   const corpo = {};
   if (payloadCriar.length > 0) corpo.create = payloadCriar;
@@ -331,14 +330,15 @@ async function sincronizar() {
         semIdentificador++;
         continue;
       }
-      paraProcessar.push({ produto, sku });
+      const skuAntigo = obterSkuAntigo(produto);
+      paraProcessar.push({ produto, sku, skuAntigo });
     }
 
     console.log(`⚙️  Preparando categorias em paralelo...`);
     try {
       await prepararCategoriasEmParalelo(paraProcessar, mapaGrupos);
     } catch (erroCategoria) {
-      console.log(`⚠️  Erro ao preparar categorias em paralelo (algumas podem ficar sem categoria nesta rodada): ${erroCategoria.message}`);
+      console.log(`⚠️  Erro ao preparar categorias em paralelo: ${erroCategoria.message}`);
     }
 
     console.log(`⚙️  ${paraProcessar.length} produtos a processar em lotes de ${TAMANHO_LOTE}...`);
@@ -346,6 +346,7 @@ async function sincronizar() {
     let criados = 0;
     let semMudanca = 0;
     let atualizados = 0;
+    let migrados = 0;
     let comErro = 0;
     const erros = [];
 
@@ -356,11 +357,24 @@ async function sincronizar() {
       const payloadCriar = [];
       const payloadAtualizar = [];
 
-      for (const { produto, sku } of lote) {
-        const produtoWoo = mapaProdutosWoo.get(sku.toLowerCase());
+      for (const { produto, sku, skuAntigo } of lote) {
+        // Primeiro tenta achar pelo SKU novo (digito)
+        let produtoWoo = mapaProdutosWoo.get(sku.toLowerCase());
+        let precisaMigrarSku = false;
+
+        // Se não achou, e existe um SKU antigo possível (referencia),
+        // tenta achar por ele - produto já existe, só precisa migrar o SKU
+        if (!produtoWoo && skuAntigo) {
+          produtoWoo = mapaProdutosWoo.get(skuAntigo.toLowerCase());
+          if (produtoWoo) {
+            precisaMigrarSku = true;
+          }
+        }
+
         if (produtoWoo) {
-          if (produtoMudou(produto, produtoWoo)) {
-            payloadAtualizar.push(montarPayloadAtualizacao(produto, produtoWoo));
+          if (precisaMigrarSku || produtoMudou(produto, produtoWoo)) {
+            payloadAtualizar.push(montarPayloadAtualizacao(produto, produtoWoo, sku, precisaMigrarSku));
+            if (precisaMigrarSku) migrados++;
           } else {
             semMudanca++;
           }
@@ -398,7 +412,7 @@ async function sincronizar() {
     }
 
     console.log(`\n--- Sincronização concluída ---`);
-    console.log(`Criados: ${criados} | Atualizados: ${atualizados} | Sem mudança (pulados): ${semMudanca} | Ignorados (grupo excluído): ${ignorados} | Pulados (sem identificador): ${semIdentificador} | Com erro: ${comErro}`);
+    console.log(`Criados: ${criados} | Atualizados: ${atualizados} (${migrados} migraram SKU de referência p/ digito) | Sem mudança: ${semMudanca} | Ignorados: ${ignorados} | Pulados (sem identificador): ${semIdentificador} | Com erro: ${comErro}`);
 
     if (erros.length > 0) {
       console.log(`\nDetalhes dos erros:`);
