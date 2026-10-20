@@ -390,6 +390,17 @@ async function sincronizar() {
     let semIdentificador = 0;
     const semPreco = [];
 
+    // SKU repetido no sistema (ex.: vários produtos com digito = 0) faria
+    // todos eles sobrescreverem o MESMO produto no site, um após o outro.
+    // Esses produtos são pulados e listados no log até o cadastro ser corrigido.
+    const contagemSku = new Map();
+    for (const produto of produtos) {
+      if (grupoExcluido(produto.classif)) continue;
+      const sku = obterSku(produto);
+      if (sku) contagemSku.set(sku.toLowerCase(), (contagemSku.get(sku.toLowerCase()) || 0) + 1);
+    }
+    const skuDuplicado = [];
+
     for (const produto of produtos) {
       if (grupoExcluido(produto.classif)) {
         ignorados++;
@@ -398,6 +409,10 @@ async function sincronizar() {
       const sku = obterSku(produto);
       if (!sku) {
         semIdentificador++;
+        continue;
+      }
+      if (contagemSku.get(sku.toLowerCase()) > 1) {
+        skuDuplicado.push(`${sku} (${produto.descricao}) - preço no sistema ${produto.preco_a}`);
         continue;
       }
       const preco = lerPreco(produto.preco_a);
@@ -516,8 +531,10 @@ async function sincronizar() {
     console.log(
       `Criados: ${criados} | Atualizados: ${atualizados} (${migrados} migraram SKU de referência p/ digito) | ` +
         `Sem mudança: ${semMudanca} | Ignorados: ${ignorados} | Pulados (sem identificador): ${semIdentificador} | ` +
-        `Sem preço válido: ${semPreco.length} | Com erro: ${comErro}`
+        `Sem preço válido: ${semPreco.length} | SKU duplicado (pulados): ${skuDuplicado.length} | Com erro: ${comErro}`
     );
+
+    imprimirLista('🚫 SKU repetido no sistema - pulados (corrigir o campo "digito" no Pixcell)', skuDuplicado);
 
     imprimirLista('💲 Preços alterados', mudancasPreco);
     imprimirLista('⚠️  Produtos com preço promocional no Woo (o site mostra a promoção, não o preço do sistema)', avisosPromocao);
