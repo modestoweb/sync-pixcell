@@ -270,6 +270,20 @@ async function carregarMapaProdutosWoo() {
   return mapa;
 }
 
+async function buscarProdutoPorSku(sku) {
+  try {
+    const resposta = await WooCommerce.get('products', {
+      sku,
+      status: 'any',
+      _fields: 'id,sku,name,type,status,regular_price,sale_price,stock_quantity',
+    });
+    return resposta.data && resposta.data.length > 0 ? resposta.data[0] : null;
+  } catch (erro) {
+    console.log(`⚠️  Busca direta do SKU ${sku} falhou: ${erro.message}`);
+    return null;
+  }
+}
+
 function dividirEmLotes(array, tamanho) {
   const lotes = [];
   for (let i = 0; i < array.length; i += tamanho) {
@@ -447,6 +461,7 @@ async function sincronizar() {
     const mudancasPreco = [];
     const avisosPromocao = [];
     const avisosVariavel = [];
+    const achadosPorBuscaDireta = [];
 
     const lotes = dividirEmLotes(paraProcessar, TAMANHO_LOTE);
 
@@ -467,6 +482,20 @@ async function sincronizar() {
           produtoWoo = mapaProdutosWoo.get(skuAntigo.toLowerCase());
           if (produtoWoo) {
             precisaMigrarSku = true;
+          }
+        }
+
+        // Ainda não achou: antes de criar, pergunta direto ao Woo por esse SKU.
+        // Pega produtos que a listagem não trouxe (ex.: SKU gravado com espaço
+        // ou caractere invisível), evitando o erro "SKU duplicado".
+        if (!produtoWoo) {
+          const encontrado = await buscarProdutoPorSku(sku);
+          if (encontrado) {
+            produtoWoo = encontrado;
+            precisaMigrarSku = String(encontrado.sku) !== sku; // regrava o SKU "limpo"
+            achadosPorBuscaDireta.push(
+              `${sku} (${encontrado.name}): id ${encontrado.id}, status ${encontrado.status}, SKU na loja ${JSON.stringify(encontrado.sku)}`
+            );
           }
         }
 
@@ -507,7 +536,8 @@ async function sincronizar() {
           if (item.error) {
             comErro++;
             const enviado = payloadCriar[idx] || {};
-            erros.push(`Criar ${item.sku || enviado.sku || '?'} (${enviado.name || '?'}): ${item.error.message}`);
+            const conflito = item.error.data?.resource_id ? ` [produto em conflito: id ${item.error.data.resource_id}]` : '';
+            erros.push(`Criar ${item.sku || enviado.sku || '?'} (${enviado.name || '?'}): ${item.error.message}${conflito}`);
           } else {
             criados++;
           }
@@ -541,6 +571,7 @@ async function sincronizar() {
 
     imprimirLista('🚫 SKU repetido no sistema - pulados (corrigir o campo "digito" no Pixcell)', skuDuplicado);
 
+    imprimirLista('🔍 Produtos que a listagem não trouxe, mas existem na loja (achados por busca direta)', achadosPorBuscaDireta);
     imprimirLista('💲 Preços alterados', mudancasPreco);
     imprimirLista('⚠️  Produtos com preço promocional no Woo (o site mostra a promoção, não o preço do sistema)', avisosPromocao);
     imprimirLista('⚠️  Produtos variáveis (não sincronizados)', avisosVariavel);
