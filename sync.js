@@ -21,10 +21,13 @@ const WooCommerce = new WooCommerceRestApi({
 });
 
 const GRUPOS_EXCLUIDOS = ['1.01.10', '1.01.11'];
-const MODO_TESTE = false;
+const MODO_TESTE = process.env.MODO_TESTE === 'true';
+// SIMULAR=true: lê tudo e mostra no log o que FARIA, mas não grava nada no WooCommerce.
+const SIMULAR = process.env.SIMULAR === 'true';
 const TAMANHO_LOTE = 100; // máximo aceito pelo endpoint products/batch do WooCommerce
 const TENTATIVAS_CONEXAO = 3;
 const ESPERA_ENTRE_TENTATIVAS_MS = 5000;
+const MAX_LINHAS_LOG_DETALHE = 50;
 
 const cacheCategoriasWoo = new Map();
 
@@ -39,7 +42,7 @@ function grupoExcluido(classif) {
 // para manter os produtos organizados de forma consistente.
 function obterSku(produto) {
   if (produto.digito !== null && produto.digito !== undefined && String(produto.digito).trim() !== '') {
-    return `DIG-${produto.digito}`;
+    return `DIG-${String(produto.digito).trim()}`;
   }
   return null;
 }
@@ -49,10 +52,28 @@ function obterSku(produto) {
 // para LOCALIZAR produtos já criados com o padrão antigo, e migrar o SKU
 // deles para o padrão novo (digito) sem duplicar o produto.
 function obterSkuAntigo(produto) {
-  if (produto.referencia && produto.referencia.trim() !== '') {
+  if (produto.referencia && String(produto.referencia).trim() !== '') {
     return String(produto.referencia).trim();
   }
   return null;
+}
+
+// O mysql2 devolve DECIMAL como texto ("12.50"); alguns sistemas gravam
+// com vírgula ("12,50"). Converte tudo para número, ou null se inválido.
+function lerPreco(valor) {
+  if (valor === null || valor === undefined || String(valor).trim() === '') return null;
+  const numero = Number(String(valor).trim().replace(',', '.'));
+  return Number.isFinite(numero) && numero > 0 ? numero : null;
+}
+
+// O WooCommerce exige estoque inteiro. "5.000" -> 5, negativo -> 0.
+function lerEstoque(valor) {
+  const numero = Math.trunc(Number(String(valor ?? '0').replace(',', '.')));
+  return Number.isFinite(numero) && numero > 0 ? numero : 0;
+}
+
+function formatarPreco(numero) {
+  return numero.toFixed(2);
 }
 
 function normalizarClassif(classif) {
@@ -101,7 +122,7 @@ async function carregarMapaGrupos(connection) {
   const mapa = new Map();
   for (const row of rows) {
     const chave = normalizarClassif(row.classif);
-    if (chave) mapa.set(chave, row.descricao.trim());
+    if (chave && row.descricao) mapa.set(chave, String(row.descricao).trim());
   }
   return mapa;
 }
@@ -112,6 +133,23 @@ function obterCategorias(produto, mapaGrupos) {
   const codigoMae = codigoCategoriaMae(classifNorm);
   const nomeMae = codigoMae ? mapaGrupos.get(codigoMae) : null;
   return { nomeMae, nomeFilha };
+}
+
+// O WooCommerce devolve nomes com HTML ("A &amp; B"); decodifica para comparar.
+function decodificarHtml(texto) {
+  return String(texto || '')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+}
+
+function categoriaConfere(c, nome, paiId) {
+  const mesmoNome = decodificarHtml(c.name).toLowerCase() === nome.toLowerCase();
+  // Categoria raiz precisa ter parent 0; subcategoria precisa ter o pai certo
+  const mesmoPai = paiId ? c.parent === paiId : c.parent === 0;
+  return mesmoNome && mesmoPai;
 }
 
 const promisesEmAndamento = new Map();
@@ -131,9 +169,12 @@ async function obterOuCriarCategoriaWoo(nome, paiId = null) {
 
   const promise = (async () => {
     const busca = await WooCommerce.get('products/categories', { search: nome, per_page: 100 });
-    let categoria = busca.data.find(
-      (c) => c.name.toLowerCase() === nome.toLowerCase() && (paiId ? c.parent === paiId : true)
-    );
+    let categoria = busca.data.find((c) => categoriaConfere(c, nome, paiId));
+
+    if (!categoria && SIMULAR) {
+      console.log(`🧪 [SIMULAÇÃO] Criaria categoria: ${nome}${paiId ? ' (subcategoria)' : ''}`);
+      return null;
+    }
 
     if (!categoria) {
       try {
@@ -143,15 +184,13 @@ async function obterOuCriarCategoriaWoo(nome, paiId = null) {
         categoria = resposta.data;
         console.log(`📂 Categoria criada: ${nome}${paiId ? ' (subcategoria)' : ''}`);
       } catch (erro) {
-        const idExistente = erro.response?.data?.resource_id;
+        const idExistente = erro.response?.data?.data?.resource_id || erro.response?.data?.resource_id;
         if (idExistente) {
           cacheCategoriasWoo.set(chaveCache, idExistente);
           return idExistente;
         }
         const buscaNovamente = await WooCommerce.get('products/categories', { search: nome, per_page: 100 });
-        const encontrada = buscaNovamente.data.find(
-          (c) => c.name.toLowerCase() === nome.toLowerCase() && (paiId ? c.parent === paiId : true)
-        );
+        const encontrada = buscaNovamente.data.find((c) => categoriaConfere(c, nome, paiId));
         if (encontrada) {
           cacheCategoriasWoo.set(chaveCache, encontrada.id);
           return encontrada.id;
@@ -203,15 +242,22 @@ async function buscarProdutosPixcell(connection) {
   return rows;
 }
 
+// Pede ao Woo só os campos usados (_fields) - a listagem fica bem mais leve
+// e rápida do que baixar o produto inteiro (descrição, imagens, etc).
 async function carregarMapaProdutosWoo() {
   const mapa = new Map();
   let pagina = 1;
   let continuar = true;
 
   while (continuar) {
-    const resposta = await WooCommerce.get('products', { per_page: 100, page: pagina, status: 'any' });
+    const resposta = await WooCommerce.get('products', {
+      per_page: 100,
+      page: pagina,
+      status: 'any',
+      _fields: 'id,sku,name,type,status,regular_price,sale_price,stock_quantity',
+    });
     for (const p of resposta.data) {
-      if (p.sku) mapa.set(p.sku.toLowerCase(), p);
+      if (p.sku) mapa.set(String(p.sku).toLowerCase(), p);
     }
     continuar = resposta.data.length === 100;
     pagina++;
@@ -228,7 +274,7 @@ function dividirEmLotes(array, tamanho) {
   return lotes;
 }
 
-function montarPayloadCriacao(produto, sku, mapaGrupos) {
+function montarPayloadCriacao(produto, sku, preco, estoque, mapaGrupos) {
   const { nomeMae, nomeFilha } = obterCategorias(produto, mapaGrupos);
   const categorias = [];
 
@@ -244,38 +290,37 @@ function montarPayloadCriacao(produto, sku, mapaGrupos) {
   return {
     sku: sku,
     name: produto.descricao,
-    regular_price: String(produto.preco_a),
+    regular_price: formatarPreco(preco),
     description: produto.descricao,
-    stock_quantity: produto.dep01,
+    stock_quantity: estoque,
     manage_stock: true,
-    stock_status: produto.dep01 > 0 ? 'instock' : 'outofstock',
+    stock_status: estoque > 0 ? 'instock' : 'outofstock',
     status: MODO_TESTE ? 'draft' : 'publish',
     categories: categorias,
   };
 }
 
-function produtoMudou(produto, produtoWoo) {
-  const precoNovo = Number(produto.preco_a) || 0;
+function compararProduto(preco, estoque, produtoWoo) {
   const precoAtual = Number(produtoWoo.regular_price) || 0;
-  const estoqueNovo = Number(produto.dep01) || 0;
   const estoqueAtual = Number(produtoWoo.stock_quantity) || 0;
-
-  const precoMudou = Math.abs(precoNovo - precoAtual) > 0.005;
-  const estoqueMudou = estoqueNovo !== estoqueAtual;
-
-  return precoMudou || estoqueMudou;
+  return {
+    precoMudou: Math.abs(preco - precoAtual) > 0.005,
+    estoqueMudou: estoque !== estoqueAtual,
+    precoAtual,
+    estoqueAtual,
+  };
 }
 
 // Monta o payload de atualização. Quando o produto foi localizado pelo SKU
 // ANTIGO (referencia), o payload também inclui o novo SKU (digito) - migra
 // a identificação sem duplicar o produto.
-function montarPayloadAtualizacao(produto, produtoWoo, novoSku, precisaMigrarSku) {
+function montarPayloadAtualizacao(produtoWoo, preco, estoque, novoSku, precisaMigrarSku) {
   const payload = {
     id: produtoWoo.id,
-    regular_price: String(produto.preco_a),
-    stock_quantity: produto.dep01,
+    regular_price: formatarPreco(preco),
+    stock_quantity: estoque,
     manage_stock: true,
-    stock_status: produto.dep01 > 0 ? 'instock' : 'outofstock',
+    stock_status: estoque > 0 ? 'instock' : 'outofstock',
   };
 
   if (precisaMigrarSku) {
@@ -294,14 +339,38 @@ async function enviarLote(payloadCriar, payloadAtualizar) {
     return { create: [], update: [] };
   }
 
+  if (SIMULAR) {
+    payloadCriar.forEach((p) => console.log(`🧪 [SIMULAÇÃO] Criaria ${p.sku} (${p.name}) por ${p.regular_price}`));
+    return {
+      create: payloadCriar.map((p) => ({ sku: p.sku })),
+      update: payloadAtualizar.map((p) => ({ id: p.id, sku: p.sku })),
+    };
+  }
+
   const resposta = await WooCommerce.post('products/batch', corpo);
   return resposta.data;
 }
 
+function imprimirLista(titulo, linhas) {
+  if (linhas.length === 0) return;
+  console.log(`\n${titulo} (${linhas.length}):`);
+  linhas.slice(0, MAX_LINHAS_LOG_DETALHE).forEach((l) => console.log(`  - ${l}`));
+  if (linhas.length > MAX_LINHAS_LOG_DETALHE) {
+    console.log(`  ... e mais ${linhas.length - MAX_LINHAS_LOG_DETALHE}`);
+  }
+}
+
 // ---- Função principal ----
 
+// Retorna true se tudo correu bem, false se houve qualquer erro.
 async function sincronizar() {
-  console.log(`\n--- Iniciando sincronização: ${new Date().toLocaleString('pt-BR')} ---`);
+  const inicio = Date.now();
+  if (SIMULAR) {
+    console.log('🧪🧪🧪 MODO SIMULAÇÃO: nada será gravado no WooCommerce 🧪🧪🧪');
+  }
+  console.log(
+    `\n--- Iniciando sincronização: ${new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })} ---`
+  );
 
   const connection = await conectarComRetry();
 
@@ -319,6 +388,7 @@ async function sincronizar() {
     const paraProcessar = [];
     let ignorados = 0;
     let semIdentificador = 0;
+    const semPreco = [];
 
     for (const produto of produtos) {
       if (grupoExcluido(produto.classif)) {
@@ -330,8 +400,14 @@ async function sincronizar() {
         semIdentificador++;
         continue;
       }
+      const preco = lerPreco(produto.preco_a);
+      if (preco === null) {
+        semPreco.push(`${sku} (${produto.descricao}): preco_a = ${produto.preco_a}`);
+        continue;
+      }
+      const estoque = lerEstoque(produto.dep01);
       const skuAntigo = obterSkuAntigo(produto);
-      paraProcessar.push({ produto, sku, skuAntigo });
+      paraProcessar.push({ produto, sku, skuAntigo, preco, estoque });
     }
 
     console.log(`⚙️  Preparando categorias em paralelo...`);
@@ -349,6 +425,9 @@ async function sincronizar() {
     let migrados = 0;
     let comErro = 0;
     const erros = [];
+    const mudancasPreco = [];
+    const avisosPromocao = [];
+    const avisosVariavel = [];
 
     const lotes = dividirEmLotes(paraProcessar, TAMANHO_LOTE);
 
@@ -356,8 +435,9 @@ async function sincronizar() {
       const lote = lotes[i];
       const payloadCriar = [];
       const payloadAtualizar = [];
+      const migracoesDoLote = new Set();
 
-      for (const { produto, sku, skuAntigo } of lote) {
+      for (const { produto, sku, skuAntigo, preco, estoque } of lote) {
         // Primeiro tenta achar pelo SKU novo (digito)
         let produtoWoo = mapaProdutosWoo.get(sku.toLowerCase());
         let precisaMigrarSku = false;
@@ -372,14 +452,32 @@ async function sincronizar() {
         }
 
         if (produtoWoo) {
-          if (precisaMigrarSku || produtoMudou(produto, produtoWoo)) {
-            payloadAtualizar.push(montarPayloadAtualizacao(produto, produtoWoo, sku, precisaMigrarSku));
-            if (precisaMigrarSku) migrados++;
+          // Produto variável: o preço fica nas variações, não no produto pai
+          if (produtoWoo.type === 'variable') {
+            avisosVariavel.push(`${sku} (${produtoWoo.name}) é variável - preço não é sincronizado`);
+            continue;
+          }
+
+          const { precoMudou, estoqueMudou, precoAtual } = compararProduto(preco, estoque, produtoWoo);
+
+          // Preço promocional preenchido no Woo "esconde" o preço normal no site
+          if (produtoWoo.sale_price && String(produtoWoo.sale_price).trim() !== '') {
+            avisosPromocao.push(
+              `${sku} (${produtoWoo.name}): site mostra promoção ${produtoWoo.sale_price}, sistema = ${formatarPreco(preco)}`
+            );
+          }
+
+          if (precisaMigrarSku || precoMudou || estoqueMudou) {
+            payloadAtualizar.push(montarPayloadAtualizacao(produtoWoo, preco, estoque, sku, precisaMigrarSku));
+            if (precisaMigrarSku) migracoesDoLote.add(produtoWoo.id);
+            if (precoMudou) {
+              mudancasPreco.push(`${sku} (${produtoWoo.name}): ${formatarPreco(precoAtual)} → ${formatarPreco(preco)}`);
+            }
           } else {
             semMudanca++;
           }
         } else {
-          payloadCriar.push(montarPayloadCriacao(produto, sku, mapaGrupos));
+          payloadCriar.push(montarPayloadCriacao(produto, sku, preco, estoque, mapaGrupos));
         }
       }
 
@@ -400,30 +498,46 @@ async function sincronizar() {
             erros.push(`Atualizar ${item.sku || item.id}: ${item.error.message}`);
           } else {
             atualizados++;
+            if (migracoesDoLote.has(item.id)) migrados++;
           }
         }
 
         console.log(`📦 Lote ${i + 1}/${lotes.length} enviado (${payloadCriar.length} criar, ${payloadAtualizar.length} atualizar)`);
       } catch (erroLote) {
-        comErro += lote.length;
-        erros.push(`Lote ${i + 1} falhou inteiro: ${erroLote.message}`);
-        console.log(`❌ Erro no lote ${i + 1}: ${erroLote.message}`);
+        comErro += payloadCriar.length + payloadAtualizar.length;
+        const detalhe = erroLote.response?.data?.message || erroLote.message;
+        erros.push(`Lote ${i + 1} falhou inteiro: ${detalhe}`);
+        console.log(`❌ Erro no lote ${i + 1}: ${detalhe}`);
       }
     }
 
-    console.log(`\n--- Sincronização concluída ---`);
-    console.log(`Criados: ${criados} | Atualizados: ${atualizados} (${migrados} migraram SKU de referência p/ digito) | Sem mudança: ${semMudanca} | Ignorados: ${ignorados} | Pulados (sem identificador): ${semIdentificador} | Com erro: ${comErro}`);
+    const duracao = Math.round((Date.now() - inicio) / 1000);
+    console.log(`\n--- Sincronização concluída em ${duracao}s ---`);
+    console.log(
+      `Criados: ${criados} | Atualizados: ${atualizados} (${migrados} migraram SKU de referência p/ digito) | ` +
+        `Sem mudança: ${semMudanca} | Ignorados: ${ignorados} | Pulados (sem identificador): ${semIdentificador} | ` +
+        `Sem preço válido: ${semPreco.length} | Com erro: ${comErro}`
+    );
 
-    if (erros.length > 0) {
-      console.log(`\nDetalhes dos erros:`);
-      erros.slice(0, 20).forEach((e) => console.log(`  - ${e}`));
-      if (erros.length > 20) console.log(`  ... e mais ${erros.length - 20} erro(s)`);
-    }
-  } catch (erro) {
-    console.error('❌ Erro geral durante a sincronização:', erro.message);
+    imprimirLista('💲 Preços alterados', mudancasPreco);
+    imprimirLista('⚠️  Produtos com preço promocional no Woo (o site mostra a promoção, não o preço do sistema)', avisosPromocao);
+    imprimirLista('⚠️  Produtos variáveis (não sincronizados)', avisosVariavel);
+    imprimirLista('⚠️  Produtos sem preço válido no sistema (não enviados)', semPreco);
+    imprimirLista('❌ Erros', erros);
+
+    return comErro === 0;
   } finally {
     await connection.end();
   }
 }
 
-sincronizar();
+// Código de saída diferente de 0 faz o GitHub Actions marcar a execução
+// como FALHA (vermelho) e mandar e-mail - antes, erro aparecia como sucesso.
+sincronizar()
+  .then((ok) => {
+    process.exitCode = ok ? 0 : 1;
+  })
+  .catch((erro) => {
+    console.error('❌ Erro geral durante a sincronização:', erro.message);
+    process.exitCode = 1;
+  });
