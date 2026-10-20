@@ -254,6 +254,10 @@ async function carregarMapaProdutosWoo() {
       per_page: 100,
       page: pagina,
       status: 'any',
+      // Ordena por ID (único). A ordem padrão é por data e, como muitos produtos
+      // foram criados no mesmo segundo pelo batch, a paginação "pulava" alguns.
+      orderby: 'id',
+      order: 'asc',
       _fields: 'id,sku,name,type,status,regular_price,sale_price,stock_quantity',
     });
     for (const p of resposta.data) {
