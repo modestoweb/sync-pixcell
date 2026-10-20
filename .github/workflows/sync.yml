@@ -1,24 +1,40 @@
 name: Sincronizar Pixcell
 
 on:
+  # O agendamento do GitHub atrasa/pula execuções (estava rodando a cada 2-7h).
+  # Fica só como reserva; o disparo principal vem de fora (cron-job.org)
+  # chamando a API do GitHub - veja LEIA-ME.md.
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch:
+    inputs:
+      simular:
+        description: 'Só simular (não grava nada no site)'
+        type: boolean
+        default: false
+
+# Impede duas sincronizações ao mesmo tempo (evita produtos duplicados).
+# Se chegar um disparo enquanto outro roda, ele espera na fila.
+concurrency:
+  group: sync-pixcell
+  cancel-in-progress: false
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Checkout do código
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Configurar Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '22'
+          cache: 'npm'
 
       - name: Instalar dependências
-        run: npm install
+        run: npm ci
 
       - name: Rodar sincronização
         env:
@@ -30,4 +46,5 @@ jobs:
           DB_USER: ${{ secrets.DB_USER }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           DB_NAME: ${{ secrets.DB_NAME }}
+          SIMULAR: ${{ inputs.simular }}
         run: node sync.js
