@@ -499,10 +499,11 @@ async function sincronizar() {
       try {
         const resultado = await enviarLote(payloadCriar, payloadAtualizar);
 
-        for (const item of resultado.create || []) {
+        for (const [idx, item] of (resultado.create || []).entries()) {
           if (item.error) {
             comErro++;
-            erros.push(`Criar ${item.sku || '?'}: ${item.error.message}`);
+            const enviado = payloadCriar[idx] || {};
+            erros.push(`Criar ${item.sku || enviado.sku || '?'} (${enviado.name || '?'}): ${item.error.message}`);
           } else {
             criados++;
           }
