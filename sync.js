@@ -41,10 +41,11 @@ function grupoExcluido(classif) {
 // "referencia" (mesmo quando ela existe). Padrão combinado com o cliente
 // para manter os produtos organizados de forma consistente.
 function obterSku(produto) {
-  if (produto.digito !== null && produto.digito !== undefined && String(produto.digito).trim() !== '') {
-    return `DIG-${String(produto.digito).trim()}`;
-  }
-  return null;
+  if (produto.digito === null || produto.digito === undefined) return null;
+  // Remove espaços e caracteres invisíveis (ex.: espaço de largura zero vindo do sistema)
+  const digito = String(produto.digito).replace(/[^\x21-\x7E]/g, '');
+  if (digito === '') return null;
+  return `DIG-${digito}`;
 }
 
 // SKU "antigo" que esse produto poderia ter recebido antes desta mudança de
@@ -403,6 +404,26 @@ async function sincronizar() {
     const produtos = await buscarProdutosPixcell(connection);
     console.log(`📦 ${produtos.length} produtos encontrados no banco Pixcell`);
 
+    // INSPECIONAR=22060,1001 : mostra a linha COMPLETA do sistema (todas as colunas)
+    // e o produto correspondente no site, para comparar preço por preço.
+    const inspecionar = (process.env.INSPECIONAR || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (inspecionar.length > 0) {
+      console.log(`\n🔬 ===== INSPEÇÃO =====`);
+      if (produtos[0]) console.log(`Colunas da tabela site_productos: ${Object.keys(produtos[0]).join(', ')}`);
+      for (const d of inspecionar) {
+        const linhas = produtos.filter((p) => String(p.digito ?? '').trim() === d);
+        console.log(`\n🔬 Dígito ${d}: ${linhas.length} linha(s) no sistema`);
+        linhas.forEach((l) => console.log(JSON.stringify(l, null, 2)));
+        const sku = `DIG-${d}`;
+        const woo = mapaProdutosWoo.get(sku.toLowerCase()) || (await buscarProdutoPorSku(sku));
+        console.log(`🔬 No site (${sku}): ${woo ? JSON.stringify(woo) : 'NÃO ENCONTRADO'}`);
+      }
+      console.log(`🔬 ===== FIM DA INSPEÇÃO =====\n`);
+    }
+
     const paraProcessar = [];
     let ignorados = 0;
     let semIdentificador = 0;
@@ -536,7 +557,18 @@ async function sincronizar() {
           if (item.error) {
             comErro++;
             const enviado = payloadCriar[idx] || {};
-            const conflito = item.error.data?.resource_id ? ` [produto em conflito: id ${item.error.data.resource_id}]` : '';
+            let conflito = '';
+            const idConflito = item.error.data?.resource_id;
+            if (idConflito) {
+              conflito = ` [produto em conflito: id ${idConflito}`;
+              try {
+                const r = await WooCommerce.get(`products/${idConflito}`, { _fields: 'id,name,sku,status,type,parent_id' });
+                conflito += ` - "${r.data.name}", tipo ${r.data.type}, status ${r.data.status}, SKU ${JSON.stringify(r.data.sku)}`;
+              } catch (e) {
+                conflito += ` - não abre como produto (${e.response?.status || e.message}); pode ser variação ou resto de produto apagado`;
+              }
+              conflito += ']';
+            }
             erros.push(`Criar ${item.sku || enviado.sku || '?'} (${enviado.name || '?'}): ${item.error.message}${conflito}`);
           } else {
             criados++;
