@@ -12,6 +12,10 @@ on:
         description: 'Só simular (não grava nada no site)'
         type: boolean
         default: false
+      inspecionar:
+        description: 'Dígitos para inspecionar, separados por vírgula (ex.: 22060,1001)'
+        type: string
+        default: ''
 
 # Impede duas sincronizações ao mesmo tempo (evita produtos duplicados).
 # Se chegar um disparo enquanto outro roda, ele espera na fila.
@@ -47,4 +51,5 @@ jobs:
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           DB_NAME: ${{ secrets.DB_NAME }}
           SIMULAR: ${{ inputs.simular }}
+          INSPECIONAR: ${{ inputs.inspecionar }}
         run: node sync.js
